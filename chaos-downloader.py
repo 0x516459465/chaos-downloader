@@ -4,349 +4,342 @@ import urllib.request
 import urllib.parse
 import json
 import zipfile
-import glob
-import subprocess
 import sqlite3
 import threading
 import concurrent.futures
+import platform
 from pathlib import Path
-from simple_term_menu import TerminalMenu
+
+import questionary
 from tabulate import tabulate
+import colorama
 
-# Clear screen
-os.system("clear")
+# Initialize colorama
+colorama.init(autoreset=True)
 
-##########################################
-# Database setup with thread safety
-##########################################
-sqliteConnection = sqlite3.connect('chaos.db', check_same_thread=False)
-cursor = sqliteConnection.cursor()
-sqlite_lock = threading.Lock()
+class ChaosDownloader:
+    def __init__(self):
+        self.Red = colorama.Fore.RED
+        self.Green = colorama.Fore.GREEN
+        self.White = colorama.Fore.WHITE
+        self.Yellow = colorama.Fore.YELLOW
+        self.Reset = colorama.Style.RESET_ALL
 
-def setup_database():
-    with sqlite_lock:
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS names (ID INTEGER PRIMARY KEY, name TEXT UNIQUE, platform TEXT, offer_bounty BOOLEAN, late_update DATE);"
-        )
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS subdomains (ID INTEGER PRIMARY KEY, subdomain TEXT UNIQUE, program_ID INTEGER, FOREIGN KEY(program_ID) REFERENCES names(ID));"
-        )
-        sqliteConnection.commit()
+        self.db_lock = threading.Lock()
+        self.setup_database()
 
-setup_database()
-
-##########################################
-# Colors for terminal output
-##########################################
-Red     = "\033[31m"
-Green   = "\033[32m"
-White   = "\033[97m"
-Yellow  = "\033[33m"
-Default = "\033[0m"
-
-##########################################
-# Load JSON data from chaos API
-##########################################
-def load_data():
-    url = "https://chaos-data.projectdiscovery.io/index.json"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    webpage = urllib.request.urlopen(req).read()
-    return json.loads(webpage)
-
-data_json = load_data()
-
-# Set up an opener with a custom header (to avoid 403 errors)
-opener = urllib.request.URLopener()
-opener.addheader('User-Agent', 'Mozilla/5.0')
-
-##########################################
-# Helper functions for database operations
-##########################################
-def insert_table_name(program_name, platform, offer_bounty):
-    with sqlite_lock:
+        # Load data immediately
         try:
-            cursor.execute(
-                "INSERT OR IGNORE INTO names(name, platform, offer_bounty, late_update) VALUES(?, ?, ?, DATE('NOW'));",
-                (program_name, platform, offer_bounty)
-            )
-            sqliteConnection.commit()
+            self.data_json = self.load_data()
         except Exception as e:
-            print("DB error:", e)
+            print(f"{self.Red}Error loading data from API: {e}{self.Reset}")
+            self.data_json = []
 
-def insert_domains(program_name, subdomain):
-    with sqlite_lock:
+        # Setup opener for urlretrieve
+        opener = urllib.request.build_opener()
+        opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
+        urllib.request.install_opener(opener)
+
+        # Menu Style
+        self.style = questionary.Style([
+            ('qmark', 'fg:red bold'),
+            ('question', 'fg:red bold'),
+            ('answer', 'fg:yellow'),
+            ('pointer', 'fg:red bold'),
+            ('highlighted', 'bg:red fg:yellow'),
+            ('selected', 'fg:yellow'),
+            ('separator', 'fg:#cc5454'),
+            ('instruction', ''),
+            ('text', ''),
+            ('disabled', 'fg:#858585 italic')
+        ])
+
+    def clear_screen(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+    def setup_database(self):
+        self.conn = sqlite3.connect('chaos.db', check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        with self.db_lock:
+            self.cursor.execute(
+                "CREATE TABLE IF NOT EXISTS names (ID INTEGER PRIMARY KEY, name TEXT UNIQUE, platform TEXT, offer_bounty BOOLEAN, late_update DATE);"
+            )
+            self.cursor.execute(
+                "CREATE TABLE IF NOT EXISTS subdomains (ID INTEGER PRIMARY KEY, subdomain TEXT UNIQUE, program_ID INTEGER, FOREIGN KEY(program_ID) REFERENCES names(ID));"
+            )
+            self.conn.commit()
+
+    def load_data(self):
+        url = "https://chaos-data.projectdiscovery.io/index.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as response:
+            webpage = response.read()
+            return json.loads(webpage)
+
+    def insert_table_name(self, program_name, platform, offer_bounty):
+        with self.db_lock:
+            try:
+                self.cursor.execute(
+                    "INSERT OR IGNORE INTO names(name, platform, offer_bounty, late_update) VALUES(?, ?, ?, DATE('NOW'));",
+                    (program_name, platform, offer_bounty)
+                )
+                self.conn.commit()
+            except Exception as e:
+                print(f"DB error: {e}")
+
+    def unzip_files(self, file_path, save_dir):
         try:
-            cursor.execute("SELECT ID FROM names WHERE name=?", (program_name,))
-            row = cursor.fetchone()
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                zf.extractall(save_dir)
+            file_path.unlink() # Delete zip file
+        except Exception as e:
+            print(f"Error unzipping {file_path}: {e}")
+
+    def download(self, download_link, save_dir, file_name, program_name, platform, offer_bounty):
+        program_dir = Path(save_dir) / program_name
+        program_dir.mkdir(parents=True, exist_ok=True)
+
+        self.insert_table_name(program_name, platform, offer_bounty)
+
+        # Encode URL
+        parsed = urllib.parse.urlsplit(download_link)
+        encoded_path = urllib.parse.quote(parsed.path)
+        download_link = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, encoded_path, parsed.query, parsed.fragment))
+
+        file_path = program_dir / file_name
+        try:
+            urllib.request.urlretrieve(download_link, str(file_path))
+            self.unzip_files(file_path, str(program_dir))
+            print(f"{self.Red}[+]{self.White} {file_name} Done {self.Green}[\u2713]{self.Reset}")
+        except Exception as e:
+            print(f"Error downloading {file_name}: {e}")
+
+    def merge_sub_files_and_insert(self, save_dir, program_name):
+        program_dir = Path(save_dir) / program_name
+        txt_files = list(program_dir.glob("*.txt"))
+        all_subdomains = []
+
+        master_file = Path(f"{save_dir}.txt")
+        # Ensure encoding is handled
+        with master_file.open("a", encoding="utf-8") as outfile:
+            for file in txt_files:
+                with file.open("r", encoding="utf-8") as infile:
+                    lines = infile.readlines()
+                    outfile.write("".join(lines))
+                    all_subdomains.extend([line.strip() for line in lines if line.strip()])
+
+        # Batch insert
+        with self.db_lock:
+            self.cursor.execute("SELECT ID FROM names WHERE name=?", (program_name,))
+            row = self.cursor.fetchone()
             if row:
                 program_id = row[0]
-                cursor.execute(
+                data_to_insert = [(sd, program_id) for sd in all_subdomains]
+                self.cursor.executemany(
                     "INSERT OR IGNORE INTO subdomains(subdomain, program_ID) VALUES(?, ?)",
-                    (subdomain, program_id)
+                    data_to_insert
                 )
-                sqliteConnection.commit()
-        except sqlite3.IntegrityError:
-            pass
+                self.conn.commit()
 
-##########################################
-# File and download functions
-##########################################
-def get_file_name(download_link):
-    return os.path.basename(download_link)
+        # New subdomains file
+        new_file_path = Path(f"new_{save_dir}.txt")
+        with new_file_path.open("a", encoding="utf-8") as new_file:
+            for sd in all_subdomains:
+                new_file.write(sd + "\n")
 
-def unzip_files(file_path, save_dir):
-    try:
-        with zipfile.ZipFile(file_path, 'r') as zf:
-            zf.extractall(save_dir)
-        os.remove(file_path)
-    except Exception as e:
-        print(f"Error unzipping {file_path}: {e}")
+    def process_program(self, program, save_dir):
+        # Extract filename from URL safely
+        file_name = Path(urllib.parse.urlparse(program["URL"]).path).name
+        program_name = program["name"]
+        platform = program["platform"]
+        bounty = program["bounty"]
+        self.download(program["URL"], save_dir, file_name, program_name, platform, bounty)
+        self.merge_sub_files_and_insert(save_dir, program_name)
 
-def download(download_link, save_dir, file_name, program_name, platform, offer_bounty):
-    # Ensure the program folder exists
-    program_dir = Path(save_dir) / program_name
-    program_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Insert the program into the database (if not already present)
-    insert_table_name(program_name, platform, offer_bounty)
-    
-    # Encode URL to avoid Unicode issues
-    parsed = urllib.parse.urlsplit(download_link)
-    encoded_path = urllib.parse.quote(parsed.path)
-    download_link = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, encoded_path, parsed.query, parsed.fragment))
-    
-    file_path = program_dir / file_name
-    try:
-        opener.retrieve(download_link, str(file_path))
-        unzip_files(str(file_path), str(program_dir))
-        print(f"{Red}[+]{White} {file_name} Done {Green}[\u2713]{White}")
-    except Exception as e:
-        print(f"Error downloading {file_name}: {e}")
+    def download_filtered_programs(self, filter_func, save_dir):
+        programs = [p for p in self.data_json if filter_func(p)]
+        print(f"Starting download of {len(programs)} programs...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(self.process_program, prog, save_dir): prog for prog in programs}
+            for future in concurrent.futures.as_completed(futures):
+                prog = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"{prog['name']} generated an exception: {exc}")
 
-def merge_sub_files_and_insert(save_dir, program_name):
-    program_dir = Path(save_dir) / program_name
-    txt_files = list(program_dir.glob("*.txt"))
-    all_subdomains = []
+    # Filter Helpers
+    def filter_by_platform(self, p, platform_name):
+        # For "self hosted", platform is empty string
+        target = platform_name.lower() if platform_name else ""
+        return p["platform"].lower() == target
 
-    # Merge all text files into one master file
-    master_file = Path(f"{save_dir}.txt")
-    with master_file.open("a", encoding="utf-8") as outfile:
-        for file in txt_files:
-            with file.open("r", encoding="utf-8") as infile:
-                lines = infile.readlines()
-                outfile.write("".join(lines))
-                all_subdomains.extend([line.strip() for line in lines if line.strip()])
-    
-    # Batch insert into the database
-    with sqlite_lock:
-        cursor.execute("SELECT ID FROM names WHERE name=?", (program_name,))
-        row = cursor.fetchone()
-        if row:
-            program_id = row[0]
-            data_to_insert = [(sd, program_id) for sd in all_subdomains]
-            cursor.executemany(
-                "INSERT OR IGNORE INTO subdomains(subdomain, program_ID) VALUES(?, ?)",
-                data_to_insert
-            )
-            sqliteConnection.commit()
-    
-    # Also write new subdomains to a separate file
-    new_file_path = Path(f"new_{save_dir}.txt")
-    with new_file_path.open("a", encoding="utf-8") as new_file:
-        for sd in all_subdomains:
-            new_file.write(sd + "\n")
+    # Menu Actions
+    def action_download_all(self):
+        self.download_filtered_programs(lambda p: True, "all_programmes")
 
-def process_program(program, save_dir):
-    file_name    = get_file_name(program["URL"])
-    program_name = program["name"]
-    platform     = program["platform"]
-    bounty       = program["bounty"]
-    download(program["URL"], save_dir, file_name, program_name, platform, bounty)
-    merge_sub_files_and_insert(save_dir, program_name)
+    def action_offer_bounty(self):
+        self.download_filtered_programs(lambda p: p["bounty"] is True, "offer_bounty")
 
-##########################################
-# Generic download for filtered programs
-##########################################
-def download_filtered_programs(filter_func, save_dir):
-    programs = [p for p in data_json if filter_func(p)]
-    print(f"Starting download of {len(programs)} programs...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(process_program, prog, save_dir): prog for prog in programs}
-        for future in concurrent.futures.as_completed(futures):
-            prog = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                print(f"{prog['name']} generated an exception: {exc}")
-    ask(save_dir)
+    def action_not_offer_bounty(self):
+        self.download_filtered_programs(lambda p: p["bounty"] is False, "not_offer_bounty")
 
-##########################################
-# Filter lambdas for various selections
-##########################################
-def filter_all(p): 
-    return True
+    def select_platform(self):
+        choices = ["Hackerone", "Bugcrowd", "Yeswehack", "Self hosted", "Back to Main Menu"]
+        answer = questionary.select("Select Platform:", choices=choices, style=self.style).ask()
+        if answer == "Back to Main Menu":
+            return None
+        return answer if answer != "Self hosted" else ""
 
-def filter_offer_bounty(p): 
-    return p["bounty"] == True
+    def action_platform(self):
+        plat = self.select_platform()
+        if plat is not None:
+            dir_name = plat if plat else "self_hosted"
+            self.download_filtered_programs(lambda p: self.filter_by_platform(p, plat), dir_name)
 
-def filter_not_offer_bounty(p): 
-    return p["bounty"] == False
+    def action_new_subdomain(self):
+        self.download_filtered_programs(lambda p: p["change"] != 0, "new_subdomains")
 
-def filter_by_platform(p, platform): 
-    # For "self hosted", platform is empty string
-    return p["platform"].lower() == platform.lower() if platform else p["platform"] == ""
+    def action_new_subdomain_and_offer_bounty(self):
+        self.download_filtered_programs(lambda p: p["change"] != 0 and p["bounty"] is True, "new_subdomains_and_offer_bounty")
 
-def filter_new_subdomain(p): 
-    return p["change"] != 0
+    def action_new_subdomain_and_offer_bounty_and_platform(self):
+        plat = self.select_platform()
+        if plat is not None:
+            dir_name = f"new_subdomain_and_offer_bounty_and_{plat}" if plat else "new_subdomain_and_offer_bounty_and_self_hosted"
+            self.download_filtered_programs(lambda p: p["change"] != 0 and p["bounty"] is True and self.filter_by_platform(p, plat), dir_name)
 
-def filter_new_and_offer(p): 
-    return p["change"] != 0 and p["bounty"] == True
+    def action_new_subdomain_and_platform(self):
+        plat = self.select_platform()
+        if plat is not None:
+            dir_name = f"new_subdomain_and_platform_{plat}" if plat else "new_subdomain_and_platform_self_hosted"
+            self.download_filtered_programs(lambda p: p["change"] != 0 and self.filter_by_platform(p, plat), dir_name)
 
-def filter_new_and_not_offer(p): 
-    return p["change"] != 0 and p["bounty"] == False
+    def action_new_subdomain_and_not_offer_bounty(self):
+        self.download_filtered_programs(lambda p: p["change"] != 0 and p["bounty"] is False, "new_subdomain_and_not_offer_bounty")
 
-##########################################
-# Download functions for menu options
-##########################################
-def download_all_programmes():
-    base_dir = "all_programmes"
-    download_filtered_programs(filter_all, base_dir)
+    def action_new_subdomain_and_not_offer_bounty_and_platform(self):
+        plat = self.select_platform()
+        if plat is not None:
+            dir_name = f"new_subdomain_and_not_offer_bounty_and_{plat}" if plat else "new_subdomain_and_not_offer_bounty_and_self_hosted"
+            self.download_filtered_programs(lambda p: p["change"] != 0 and p["bounty"] is False and self.filter_by_platform(p, plat), dir_name)
 
-def download_offer_bounty():
-    base_dir = "offer_bounty"
-    download_filtered_programs(filter_offer_bounty, base_dir)
+    def action_offer_bounty_and_platform(self):
+        plat = self.select_platform()
+        if plat is not None:
+            dir_name = f"offer_bounty_and_{plat}" if plat else "offer_bounty_and_self_hosted"
+            self.download_filtered_programs(lambda p: p["bounty"] is True and self.filter_by_platform(p, plat), dir_name)
 
-def download_not_offer_bounty():
-    base_dir = "not_offer_bounty"
-    download_filtered_programs(filter_not_offer_bounty, base_dir)
+    def action_not_offer_bounty_and_platform(self):
+        plat = self.select_platform()
+        if plat is not None:
+            dir_name = f"not_offer_bounty_and_{plat}" if plat else "not_offer_bounty_and_self_hosted"
+            self.download_filtered_programs(lambda p: p["bounty"] is False and self.filter_by_platform(p, plat), dir_name)
 
-def download_by_platform(platform_name):
-    base_dir = platform_name if platform_name else "self_hosted"
-    download_filtered_programs(lambda p: filter_by_platform(p, platform_name), base_dir)
+    def action_specific_program(self):
+        prog_options = sorted([p["name"] for p in self.data_json])
+        # Using checkbox for selection.
+        selected_progs = questionary.checkbox(
+            "Select Programs (Space to select, Enter to confirm):",
+            choices=prog_options,
+            style=self.style
+        ).ask()
 
-def download_new_subdomain():
-    base_dir = "new_subdomains"
-    download_filtered_programs(filter_new_subdomain, base_dir)
+        if selected_progs:
+            for prog_name in selected_progs:
+                self.download_specific_program_logic(prog_name)
 
-def new_subdomains_and_offer_bounty():
-    base_dir = "new_subdomains_and_offer_bounty"
-    download_filtered_programs(lambda p: filter_new_and_offer(p), base_dir)
+    def download_specific_program_logic(self, program_name):
+        base_dir = program_name
+        programs = [p for p in self.data_json if p["name"] == program_name]
+        if programs:
+            p = programs[0]
+            info_table = [
+                ["name", p['name']],
+                ["program url", p['URL']],
+                ["total subdomains", p['count']],
+                ["new subdomains", p['change']],
+                ["is new", p['is_new']],
+                ["platform", p['platform']],
+                ["offer reward", p['bounty']],
+                ["last_updated", p['last_updated'][:10]]
+            ]
+            print(tabulate(info_table, headers=["Info", program_name], tablefmt="double_grid"))
+            self.download_filtered_programs(lambda p: p["name"] == program_name, base_dir)
+        else:
+            print("Program not found.")
 
-def new_subdomain_and_offer_bounty_and_platform(platform_name):
-    base_dir = f"new_subdomain_and_offer_bounty_and_{platform_name}" if platform_name else "new_subdomain_and_offer_bounty_and_self_hosted"
-    download_filtered_programs(lambda p: filter_new_and_offer(p) and filter_by_platform(p, platform_name), base_dir)
+    def action_info(self):
+        if not self.data_json:
+            print("No data available.")
+            return
 
-def new_subdomain_and_platform(platform_name):
-    base_dir = f"new_subdomain_and_platform_{platform_name}" if platform_name else "new_subdomain_and_platform_self_hosted"
-    download_filtered_programs(lambda p: filter_new_subdomain(p) and filter_by_platform(p, platform_name), base_dir)
+        last_update = self.data_json[0]['last_updated'][:10]
+        total_subdomains = sum(p["count"] for p in self.data_json)
+        programs_changed = sum(1 for p in self.data_json if p["change"] != 0)
+        new_programs = sum(1 for p in self.data_json if p["is_new"] == True)
+        hackerone_programs = sum(1 for p in self.data_json if p["platform"].lower() == "hackerone")
+        bugcrowd_programs = sum(1 for p in self.data_json if p["platform"].lower() == "bugcrowd")
+        yeswehacker_programs = sum(1 for p in self.data_json if p["platform"].lower() == "yeswehack")
+        self_hosted_programs = sum(1 for p in self.data_json if p["platform"] == "")
+        programs_with_rewards = sum(1 for p in self.data_json if p["bounty"] == True)
+        programs_with_no_rewards = sum(1 for p in self.data_json if p["bounty"] == False)
+        programs_with_swag = sum(1 for p in self.data_json if 'swag' in p)
 
-def new_subdomain_and_not_offer_bounty():
-    base_dir = "new_subdomain_and_not_offer_bounty"
-    download_filtered_programs(lambda p: filter_new_and_not_offer(p), base_dir)
-
-def new_subdomain_and_not_offer_bounty_and_platform(platform_name):
-    base_dir = f"new_subdomain_and_not_offer_bounty_and_{platform_name}" if platform_name else "new_subdomain_and_not_offer_bounty_and_self_hosted"
-    download_filtered_programs(lambda p: filter_new_and_not_offer(p) and filter_by_platform(p, platform_name), base_dir)
-
-def offer_bounty_and_platform(platform_name):
-    base_dir = f"offer_bounty_and_{platform_name}" if platform_name else "offer_bounty_and_self_hosted"
-    download_filtered_programs(lambda p: p["bounty"] == True and filter_by_platform(p, platform_name), base_dir)
-
-def not_offer_bounty_and_platform(platform_name):
-    base_dir = f"not_offer_bounty_and_{platform_name}" if platform_name else "not_offer_bounty_and_self_hosted"
-    download_filtered_programs(lambda p: p["bounty"] == False and filter_by_platform(p, platform_name), base_dir)
-
-def download_specific_program(program_name):
-    base_dir = program_name
-    programs = [p for p in data_json if p["name"] == program_name]
-    if programs:
-        p = programs[0]
-        info_table = [
-            ["name", p['name']],
-            ["program url", p['URL']],
-            ["total subdomains", p['count']],
-            ["new subdomains", p['change']],
-            ["is new", p['is_new']],
-            ["platform", p['platform']],
-            ["offer reward", p['bounty']],
-            ["last_updated", p['last_updated'][:10]]
+        info_options = [
+            f"Programs last updated in {last_update}",
+            f"{total_subdomains} Subdomains.",
+            f"{len(self.data_json)} Programs.",
+            f"{programs_changed} Programs changed.",
+            f"{new_programs} New programs.",
+            f"{hackerone_programs} Hackerone programs.",
+            f"{bugcrowd_programs} Bugcrowd programs.",
+            f"{yeswehacker_programs} Yeswehack programs.",
+            f"{self_hosted_programs} Self hosted programs.",
+            f"{programs_with_rewards} Programs with rewards.",
+            f"{programs_with_swag} Programs offer swags.",
+            f"{programs_with_no_rewards} No rewards programs.",
+            "Back to Main Menu"
         ]
-        print(tabulate(info_table, headers=["Info", program_name], tablefmt="double_grid"))
-        download_filtered_programs(lambda p: p["name"] == program_name, base_dir)
-    else:
-        print("Program not found.")
 
-##########################################
-# Functions for external commands & export
-##########################################
-def httprobe_command(file_name):
-    cmd = f'cat "new_{file_name}.txt" | httprobe -c 1000 | tee -a "live_domains_{file_name}_httprobe.txt"'
-    with open(f"live_domains_{file_name}_httprobe.txt", "w", encoding="utf-8") as f:
-        pass  # Truncate file first
-    p1 = subprocess.Popen(cmd, shell=True, text=True, stdout=subprocess.PIPE, bufsize=1)
-    for line in p1.stdout:
-        print(line, end='')
+        questionary.select(
+            "Info Menu",
+            choices=info_options,
+            style=self.style
+        ).ask()
 
-def httpx_command(file_name):
-    cmd = f'cat "new_{file_name}.txt" | httpx -t 200 -silent -nc -rl 600 | tee -a "live_domains_{file_name}_httpx.txt"'
-    with open(f"live_domains_{file_name}_httpx.txt", "w", encoding="utf-8") as f:
-        pass
-    p1 = subprocess.Popen(cmd, shell=True, text=True, stdout=subprocess.PIPE, bufsize=1)
-    for line in p1.stdout:
-        print(line, end='')
+    def action_export(self):
+        try:
+            programme_names = sorted([p["name"] for p in self.data_json])
+            selected = questionary.checkbox(
+                "Select programs to export (Space to select, Enter to confirm):",
+                choices=programme_names,
+                style=self.style
+            ).ask()
 
-def ask(first_dir):
-    print("\n")
-    options = ["httprobe", "httpx", "Back to Main Menu", "Exit"]
-    menu = TerminalMenu(
-        options,
-        title="Do you want to use httprobe or httpx?",
-        menu_cursor=main_menu_cursor,
-        menu_cursor_style=main_menu_cursor_style,
-        menu_highlight_style=main_menu_style
-    )
-    choice = menu.show()
-    if choice == 0:
-        httprobe_command(first_dir)
-    elif choice == 1:
-        httpx_command(first_dir)
-    elif choice == 2:
-        return
-    else:
-        exit(0)
+            if selected:
+                for prog in selected:
+                    with self.db_lock:
+                        self.cursor.execute("SELECT ID FROM names WHERE name=?", (prog,))
+                        row = self.cursor.fetchone()
+                        subdomains = []
+                        if row:
+                            program_id = row[0]
+                            self.cursor.execute("SELECT subdomain FROM subdomains WHERE program_ID=?", (program_id,))
+                            subdomains = [r[0] for r in self.cursor.fetchall()]
 
-def export_programme():
-    try:
-        programme_names = [p["name"] for p in data_json]
-        export_menu = TerminalMenu(
-            programme_names,
-            title=main_menu_title + "  Export Menu.\n  Press Q or Esc to back to main menu. \n",
-            show_search_hint=True,
-            menu_cursor=main_menu_cursor,
-            menu_cursor_style=main_menu_cursor_style,
-            menu_highlight_style=main_menu_style,
-            multi_select=True,
-            show_multi_select_hint=True
-        )
-        _ = export_menu.show()
-        for prog in export_menu.chosen_menu_entries:
-            with sqlite_lock:
-                cursor.execute("SELECT ID FROM names WHERE name=?", (prog,))
-                row = cursor.fetchone()
-                if row:
-                    program_id = row[0]
-                    cursor.execute("SELECT subdomain FROM subdomains WHERE program_ID=?", (program_id,))
-                    subdomains = [r[0] for r in cursor.fetchall()]
-            with open(f"{prog}_exported.txt", "w", encoding="utf-8") as file:
-                for sd in subdomains:
-                    file.write(sd + "\n")
-    except Exception as e:
-        print(e)
+                    if subdomains:
+                        with open(f"{prog}_exported.txt", "w", encoding="utf-8") as file:
+                            for sd in subdomains:
+                                file.write(sd + "\n")
+                        print(f"Exported {prog} to {prog}_exported.txt")
+                    else:
+                        print(f"No subdomains found for {prog} in DB.")
+        except Exception as e:
+            print(f"Export error: {e}")
 
-##########################################
-# Main menu definitions and loop
-##########################################
-main_menu_title = """
+    def main_menu(self):
+        title = """
           _____ _                       _____                      _                 _           
          / ____| |                     |  __ \\                    | |               | |          
         | |    | |__   __ _  ___  ___  | |  | | _____      ___ __ | | ___   __ _  __| | ___ _ __ 
@@ -356,218 +349,65 @@ main_menu_title = """
 
         This tool is designed to deal with chaos API from projectdiscovery.io
                     https://chaos.projectdiscovery.io/
-"""
+        """
+        print(self.Red + title + self.Reset)
 
-main_menu_items = [
-    "all programmes",
-    "offer bounty",
-    "not offer bounty",
-    "platform",
-    "new subdomain",
-    "new subdomain and offer bounty",
-    "new subdomain and offer bounty and platform",
-    "new subdomain and platform", 
-    "new subdomain and not offer bounty",
-    "new subdomain and not offer bounty and platform", 
-    "offer bounty and platform",
-    "not offer bounty and platform",
-    "specific programs",
-    "Info about programs",
-    "Export programme from database",
-    "Quit"
-]
+        choices = [
+            "All Programmes",
+            "Offer Bounty",
+            "Not Offer Bounty",
+            "Platform",
+            "New Subdomain",
+            "New Subdomain and Offer Bounty",
+            "New Subdomain and Offer Bounty and Platform",
+            "New Subdomain and Platform",
+            "New Subdomain and Not Offer Bounty",
+            "New Subdomain and Not Offer Bounty and Platform",
+            "Offer Bounty and Platform",
+            "Not Offer Bounty and Platform",
+            "Specific Programs",
+            "Info about Programs",
+            "Export Programme from Database",
+            "Quit"
+        ]
 
-main_menu_cursor = "> "
-main_menu_cursor_style = ("fg_red", "bold")
-main_menu_style = ("bg_red", "fg_yellow")
+        while True:
+            choice = questionary.select(
+                "Main Menu",
+                choices=choices,
+                style=self.style
+            ).ask()
 
-def main():
-    main_menu = TerminalMenu(
-        menu_entries=main_menu_items,
-        title=main_menu_title + "  Main Menu.\n  Press Q or Esc to back to main menu. \n",
-        menu_cursor=main_menu_cursor,
-        menu_cursor_style=main_menu_cursor_style,
-        menu_highlight_style=main_menu_style,
-        cycle_cursor=True,
-        clear_screen=False,
-    )
-    while True:
-        choice = main_menu.show()
-        if choice == 0:
-            download_all_programmes()
-        elif choice == 1:
-            download_offer_bounty()
-        elif choice == 2:
-            download_not_offer_bounty()
-        elif choice == 3:
-            platform_options = ["Hackerone", "Bugcrowd", "Yeswehack", "Self hosted", "Back to Main Menu"]
-            plat_menu = TerminalMenu(
-                platform_options,
-                title=main_menu_title + "  Platform Menu.\n  Press Q or Esc to back to main menu. \n",
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style,
-                cycle_cursor=True,
-                clear_screen=True,
-            )
-            p_choice = plat_menu.show()
-            if p_choice in [0, 1, 2, 3]:
-                plat = platform_options[p_choice]
-                if plat.lower() == "self hosted":
-                    plat = ""
-                download_by_platform(plat)
-        elif choice == 4:
-            download_new_subdomain()
-        elif choice == 5:
-            new_subdomains_and_offer_bounty()
-        elif choice == 6:
-            platform_options = ["Hackerone", "Bugcrowd", "Yeswehack", "Self hosted", "Back to Main Menu"]
-            plat_menu = TerminalMenu(
-                platform_options,
-                title=main_menu_title + "  Platform Menu.\n  Press Q or Esc to back to main menu. \n",
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style,
-                cycle_cursor=True,
-                clear_screen=True,
-            )
-            p_choice = plat_menu.show()
-            if p_choice in [0, 1, 2, 3]:
-                plat = platform_options[p_choice]
-                if plat.lower() == "self hosted":
-                    plat = ""
-                new_subdomain_and_offer_bounty_and_platform(plat)
-        elif choice == 7:
-            platform_options = ["Hackerone", "Bugcrowd", "Yeswehack", "Self hosted", "Back to Main Menu"]
-            plat_menu = TerminalMenu(
-                platform_options,
-                title=main_menu_title + "  Platform Menu.\n  Press Q or Esc to back to main menu. \n",
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style,
-                cycle_cursor=True,
-                clear_screen=True,
-            )
-            p_choice = plat_menu.show()
-            if p_choice in [0, 1, 2, 3]:
-                plat = platform_options[p_choice]
-                if plat.lower() == "self hosted":
-                    plat = ""
-                new_subdomain_and_platform(plat)
-        elif choice == 8:
-            new_subdomain_and_not_offer_bounty()
-        elif choice == 9:
-            platform_options = ["Hackerone", "Bugcrowd", "Yeswehack", "Self hosted", "Back to Main Menu"]
-            plat_menu = TerminalMenu(
-                platform_options,
-                title=main_menu_title + "  Platform Menu.\n  Press Q or Esc to back to main menu. \n",
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style,
-                cycle_cursor=True,
-                clear_screen=True,
-            )
-            p_choice = plat_menu.show()
-            if p_choice in [0, 1, 2, 3]:
-                plat = platform_options[p_choice]
-                if plat.lower() == "self hosted":
-                    plat = ""
-                new_subdomain_and_not_offer_bounty_and_platform(plat)
-        elif choice == 10:
-            platform_options = ["Hackerone", "Bugcrowd", "Yeswehack", "Self hosted", "Back to Main Menu"]
-            plat_menu = TerminalMenu(
-                platform_options,
-                title=main_menu_title + "  Platform Menu.\n  Press Q or Esc to back to main menu. \n",
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style,
-                cycle_cursor=True,
-                clear_screen=True,
-            )
-            p_choice = plat_menu.show()
-            if p_choice in [0, 1, 2, 3]:
-                plat = platform_options[p_choice]
-                if plat.lower() == "self hosted":
-                    plat = ""
-                offer_bounty_and_platform(plat)
-        elif choice == 11:
-            platform_options = ["Hackerone", "Bugcrowd", "Yeswehack", "Self hosted", "Back to Main Menu"]
-            plat_menu = TerminalMenu(
-                platform_options,
-                title=main_menu_title + "  Platform Menu.\n  Press Q or Esc to back to main menu. \n",
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style,
-                cycle_cursor=True,
-                clear_screen=True,
-            )
-            p_choice = plat_menu.show()
-            if p_choice in [0, 1, 2, 3]:
-                plat = platform_options[p_choice]
-                if plat.lower() == "self hosted":
-                    plat = ""
-                not_offer_bounty_and_platform(plat)
-        elif choice == 12:
-            prog_options = [p["name"] for p in data_json]
-            prog_menu = TerminalMenu(
-                prog_options,
-                title=main_menu_title + "  Programs Menu.\n  Press Q or Esc to back to main menu. \n",
-                show_search_hint=True,
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style,
-                multi_select=True,
-                show_multi_select_hint=True
-            )
-            _ = prog_menu.show()
-            for prog in prog_menu.chosen_menu_entries:
-                download_specific_program(prog)
-        elif choice == 13:
-            # Info menu
-            last_update = data_json[0]['last_updated'][:10]
-            total_subdomains = sum(p["count"] for p in data_json)
-            programs_changed = sum(1 for p in data_json if p["change"] != 0)
-            new_programs = sum(1 for p in data_json if p["is_new"] == True)
-            hackerone_programs = sum(1 for p in data_json if p["platform"].lower() == "hackerone")
-            bugcrowd_programs = sum(1 for p in data_json if p["platform"].lower() == "bugcrowd")
-            yeswehacker_programs = sum(1 for p in data_json if p["platform"].lower() == "yeswehack")
-            self_hosted_programs = sum(1 for p in data_json if p["platform"] == "")
-            programs_with_rewards = sum(1 for p in data_json if p["bounty"] == True)
-            programs_with_no_rewards = sum(1 for p in data_json if p["bounty"] == False)
-            programs_with_swag = sum(1 for p in data_json if 'swag' in p)
+            if choice == "Quit":
+                break
 
-            info_options = [
-                f"Programs last updated in {last_update}",
-                f"{total_subdomains} Subdomains.",
-                f"{len(data_json)} Programs.",
-                f"{programs_changed} Programs changed.",
-                f"{new_programs} New programs.",
-                f"{hackerone_programs} Hackerone programs.",
-                f"{bugcrowd_programs} Bugcrowd programs.",
-                f"{yeswehacker_programs} Yeswehack programs.",
-                f"{self_hosted_programs} Self hosted programs.",
-                f"{programs_with_rewards} Programs with rewards.",
-                f"{programs_with_swag} Programs offer swags.",
-                f"{programs_with_no_rewards} No rewards programs.",
-                "Back to Main Menu",
-                "Exit"
-            ]
-            info_menu = TerminalMenu(
-                info_options,
-                title=main_menu_title + "  Info Menu.\n  Press Q or Esc to back to main menu. \n",
-                menu_cursor=main_menu_cursor,
-                menu_cursor_style=main_menu_cursor_style,
-                menu_highlight_style=main_menu_style
-            )
-            i_choice = info_menu.show()
-            if i_choice == len(info_options) - 1:
-                exit(0)
-        elif choice == 14:
-            export_programme()
-        elif choice == 15:
-            print("Quit Selected")
-            break
+            # Map choices to functions
+            actions = {
+                "All Programmes": self.action_download_all,
+                "Offer Bounty": self.action_offer_bounty,
+                "Not Offer Bounty": self.action_not_offer_bounty,
+                "Platform": self.action_platform,
+                "New Subdomain": self.action_new_subdomain,
+                "New Subdomain and Offer Bounty": self.action_new_subdomain_and_offer_bounty,
+                "New Subdomain and Offer Bounty and Platform": self.action_new_subdomain_and_offer_bounty_and_platform,
+                "New Subdomain and Platform": self.action_new_subdomain_and_platform,
+                "New Subdomain and Not Offer Bounty": self.action_new_subdomain_and_not_offer_bounty,
+                "New Subdomain and Not Offer Bounty and Platform": self.action_new_subdomain_and_not_offer_bounty_and_platform,
+                "Offer Bounty and Platform": self.action_offer_bounty_and_platform,
+                "Not Offer Bounty and Platform": self.action_not_offer_bounty_and_platform,
+                "Specific Programs": self.action_specific_program,
+                "Info about Programs": self.action_info,
+                "Export Programme from Database": self.action_export,
+            }
+
+            action = actions.get(choice)
+            if action:
+                action()
+                input("\nPress Enter to continue...")
+                self.clear_screen()
+                print(self.Red + title + self.Reset)
 
 if __name__ == "__main__":
-    os.system("clear")
-    main()
+    app = ChaosDownloader()
+    app.clear_screen()
+    app.main_menu()
