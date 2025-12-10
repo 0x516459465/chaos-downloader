@@ -87,7 +87,7 @@ class ChaosDownloader:
                 )
                 self.conn.commit()
             except Exception as e:
-                print(f"DB error: {e}")
+                tqdm.write(f"DB error: {e}")
 
     def unzip_files(self, file_path, save_dir):
         try:
@@ -95,7 +95,7 @@ class ChaosDownloader:
                 zf.extractall(save_dir)
             file_path.unlink() # Delete zip file
         except Exception as e:
-            print(f"Error unzipping {file_path}: {e}")
+            tqdm.write(f"Error unzipping {file_path}: {e}")
 
     def download(self, download_link, save_dir, file_name, program_name, platform, offer_bounty):
         program_dir = Path(save_dir) / program_name
@@ -112,9 +112,9 @@ class ChaosDownloader:
         try:
             urllib.request.urlretrieve(download_link, str(file_path))
             self.unzip_files(file_path, str(program_dir))
-            print(f"{self.Red}[+]{self.White} {file_name} Done {self.Green}[\u2713]{self.Reset}")
+            tqdm.write(f"{self.Red}[+]{self.White} {file_name} Done {self.Green}[\u2713]{self.Reset}")
         except Exception as e:
-            print(f"Error downloading {file_name}: {e}")
+            tqdm.write(f"Error downloading {file_name}: {e}")
 
     def merge_sub_files_and_insert(self, save_dir, program_name):
         program_dir = Path(save_dir) / program_name
@@ -169,7 +169,7 @@ class ChaosDownloader:
             futures = {executor.submit(self.process_program, prog, save_dir): prog for prog in programs}
 
             # Using tqdm to show progress bar
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(programs), desc="Downloading", unit="prog"):
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(programs), desc="Downloading", unit="prog", colour='green'):
                 prog = futures[future]
                 try:
                     future.result()
