@@ -13,6 +13,7 @@ from pathlib import Path
 import questionary
 from tabulate import tabulate
 import colorama
+from tqdm import tqdm
 
 # Initialize colorama
 colorama.init(autoreset=True)
@@ -26,6 +27,7 @@ class ChaosDownloader:
         self.Reset = colorama.Style.RESET_ALL
 
         self.db_lock = threading.Lock()
+        self.file_lock = threading.Lock()
         self.setup_database()
 
         # Load data immediately
@@ -119,16 +121,26 @@ class ChaosDownloader:
         txt_files = list(program_dir.glob("*.txt"))
         all_subdomains = []
 
-        master_file = Path(f"{save_dir}.txt")
-        # Ensure encoding is handled
-        with master_file.open("a", encoding="utf-8") as outfile:
-            for file in txt_files:
-                with file.open("r", encoding="utf-8") as infile:
-                    lines = infile.readlines()
-                    outfile.write("".join(lines))
-                    all_subdomains.extend([line.strip() for line in lines if line.strip()])
+        # Read subdomains first to minimize lock time
+        for file in txt_files:
+            with file.open("r", encoding="utf-8") as infile:
+                lines = infile.readlines()
+                all_subdomains.extend([line.strip() for line in lines if line.strip()])
 
-        # Batch insert
+        # Critical section: Writing to shared files
+        with self.file_lock:
+            master_file = Path(f"{save_dir}.txt")
+            with master_file.open("a", encoding="utf-8") as outfile:
+                for sd in all_subdomains:
+                    outfile.write(sd + "\n")
+
+            # New subdomains file
+            new_file_path = Path(f"new_{save_dir}.txt")
+            with new_file_path.open("a", encoding="utf-8") as new_file:
+                for sd in all_subdomains:
+                    new_file.write(sd + "\n")
+
+        # Batch insert (DB lock handled internally)
         with self.db_lock:
             self.cursor.execute("SELECT ID FROM names WHERE name=?", (program_name,))
             row = self.cursor.fetchone()
@@ -140,12 +152,6 @@ class ChaosDownloader:
                     data_to_insert
                 )
                 self.conn.commit()
-
-        # New subdomains file
-        new_file_path = Path(f"new_{save_dir}.txt")
-        with new_file_path.open("a", encoding="utf-8") as new_file:
-            for sd in all_subdomains:
-                new_file.write(sd + "\n")
 
     def process_program(self, program, save_dir):
         # Extract filename from URL safely
@@ -161,12 +167,14 @@ class ChaosDownloader:
         print(f"Starting download of {len(programs)} programs...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(self.process_program, prog, save_dir): prog for prog in programs}
-            for future in concurrent.futures.as_completed(futures):
+
+            # Using tqdm to show progress bar
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(programs), desc="Downloading", unit="prog"):
                 prog = futures[future]
                 try:
                     future.result()
                 except Exception as exc:
-                    print(f"{prog['name']} generated an exception: {exc}")
+                    tqdm.write(f"{prog['name']} generated an exception: {exc}")
 
     # Filter Helpers
     def filter_by_platform(self, p, platform_name):

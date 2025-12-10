@@ -1,3 +1,4 @@
 questionary
 tabulate
 colorama
+tqdm
