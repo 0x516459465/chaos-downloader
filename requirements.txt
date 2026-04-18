@@ -1,4 +1,3 @@
-questionary
-tabulate
-colorama
-tqdm
+httpx>=0.27
+questionary>=2.0
+rich>=13.7

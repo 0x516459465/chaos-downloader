@@ -1,0 +1,50 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ----- Virtualenvs -----
+venv/
+.venv/
+env/
+.env
+
+# ----- OS / editors -----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ----- Local tooling -----
+.claude/
+
+# ----- Runtime artifacts -----
+chaos.db
+*.zip
+*.sqlite
+*.sqlite3
+
+# ----- Generated subdomain output (keep requirements.txt tracked) -----
+*.txt
+!requirements.txt
+
+# ----- Known output directories (menu filters) -----
+all_programmes/
+offer_bounty/
+not_offer_bounty/
+hackerone/
+bugcrowd/
+yeswehack/
+self_hosted/
+new_subdomains/
+new_subdomains_and_offer_bounty/
+new_subdomain_and_offer_bounty_and_*/
+new_subdomain_and_platform_*/
+new_subdomain_and_not_offer_bounty/
+new_subdomain_and_not_offer_bounty_and_*/
+offer_bounty_and_*/
+not_offer_bounty_and_*/
